@@ -129,22 +129,27 @@ def get_clip(term, used, path):
 def build_scene(i, sentence, term, work, used):
     audio = os.path.join(work, f"s{i}.mp3")
     clip = os.path.join(work, f"c{i}.mp4")
-    sub = os.path.join(work, f"t{i}.txt")
     out = os.path.join(work, f"scene{i}.mp4")
 
     make_audio(sentence, audio)
     dur = duration(audio) + 0.3
     get_clip(term, used, clip)
 
-    with open(sub, "w", encoding="utf-8") as f:
-        f.write(textwrap.fill(sentence, width=24))
-
-    vf = (
-        "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30,"
-        f"drawtext=fontfile={FONT}:textfile={sub}:fontcolor=white:fontsize=62:"
-        "line_spacing=14:borderw=4:bordercolor=black:box=1:boxcolor=black@0.35:"
-        "boxborderw=26:x=(w-text_w)/2:y=h*0.6"
-    )
+    # هر خط زیرنویس یک drawtext جداست تا کاراکتر خط جدید به شکل مربع نمایش داده نشود
+    lines = textwrap.wrap(sentence, width=24)
+    filters = ["scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30"]
+    y0 = int(1180 - len(lines) * 52)
+    for j, line in enumerate(lines):
+        line_file = os.path.join(work, f"t{i}_{j}.txt")
+        with open(line_file, "w", encoding="utf-8") as f:
+            f.write(line)
+        filters.append(
+            f"drawtext=fontfile={FONT}:textfile={line_file}:expansion=none:"
+            "fontcolor=white:fontsize=62:borderw=3:bordercolor=black:"
+            "box=1:boxcolor=black@0.45:boxborderw=18:"
+            f"x=(w-text_w)/2:y={y0 + j * 104}"
+        )
+    vf = ",".join(filters)
     subprocess.run(
         [
             "ffmpeg", "-y", "-loglevel", "error",
