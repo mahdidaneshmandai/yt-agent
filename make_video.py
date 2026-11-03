@@ -15,7 +15,7 @@ from googleapiclient.http import MediaFileUpload
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-PEXELS_KEY = os.environ["PEXELS_API_KEY"]
+PIXABAY_KEY = os.environ["PIXABAY_API_KEY"]
 
 VOICE = "en-US-AndrewNeural"
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -85,31 +85,26 @@ def duration(path):
     return float(out.decode().strip())
 
 
-# ---------- Pexels ----------
-def pexels_clip(term, used):
+# ---------- Pixabay ----------
+def pixabay_clip(term, used):
     r = requests.get(
-        "https://api.pexels.com/videos/search",
-        headers={"Authorization": PEXELS_KEY},
-        params={"query": term, "orientation": "portrait", "size": "medium", "per_page": 15},
+        "https://pixabay.com/api/videos/",
+        params={"key": PIXABAY_KEY, "q": term[:100], "per_page": 20, "safesearch": "true"},
         timeout=30,
     )
     r.raise_for_status()
-    videos = r.json().get("videos", [])
-    random.shuffle(videos)
-    for v in videos:
-        if v["id"] in used:
+    hits = r.json().get("hits", [])
+    random.shuffle(hits)
+    for h in hits:
+        if h["id"] in used:
             continue
-        files = [
-            f for f in v.get("video_files", [])
-            if f.get("file_type") == "video/mp4"
-            and f.get("width") and f.get("height")
-            and f["height"] > f["width"]
-        ]
-        if not files:
-            continue
-        files.sort(key=lambda f: abs(f["width"] - 1080))
-        used.add(v["id"])
-        return files[0]["link"]
+        videos = h.get("videos", {})
+        for size in ("large", "medium"):
+            v = videos.get(size) or {}
+            # از فایل‌های خیلی حجیم صرف‌نظر می‌کنیم
+            if v.get("url") and v.get("size", 0) < 60_000_000:
+                used.add(h["id"])
+                return v["url"]
     return None
 
 
@@ -123,7 +118,7 @@ def download(url, path):
 
 def get_clip(term, used, path):
     for t in [term] + FALLBACK_TERMS:
-        link = pexels_clip(t, used)
+        link = pixabay_clip(t, used)
         if link:
             download(link, path)
             return
@@ -209,7 +204,7 @@ def upload(row, path):
     body = {
         "snippet": {
             "title": title,
-            "description": row["description"].strip() + "\n\n#Shorts",
+            "description": row["description"].strip() + "\n\nStock footage: Pixabay\n#Shorts",
             "tags": row.get("tags") or [],
             "categoryId": "27",  # Education
         },
