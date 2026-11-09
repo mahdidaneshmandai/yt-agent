@@ -1,5 +1,8 @@
-# ساخت یک ویدیوی شورت از صف Supabase و آپلود خصوصی در یوتوب
-# نسخه ۳: ترتیب تصویر هر صحنه: ۱) کلیپ Pixabay ۲) تصویر AI (Cloudflare FLUX) با زوم ۳) عکس Pixabay ۴) کلیپ عمومی
+# ساخت یک ویدیوی شورت بلند از صف Supabase و آپلود خصوصی در یوتوب
+# نسخه ۴: ویدیوی ۹۰ تا ۱۳۰ ثانیه‌ای، روزی یکی
+#  - هر صحنه نوع دارد: footage (کلیپ Pixabay اول) یا illustration (تصویر AI اول)
+#  - تصویر AI: Cloudflare FLUX.1 schnell با ۸ مرحله و زوم آرام
+#  - ردیف‌های با priority بالاتر زودتر ساخته می‌شوند
 # عکس/ویدیوی خود مهدی از باکت media (اختیاری) همچنان اولویت اول دارد
 import asyncio
 import base64
@@ -30,15 +33,16 @@ FONT_FALLBACK = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 FONT_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-ExtraBold.ttf"
 FONT = FONT_FALLBACK  # در main() اگر دانلود موفق بود عوض می‌شود
 FALLBACK_TERMS = ["nature landscape", "abstract background", "city lights"]
-MAX_SECONDS = 170  # حداکثر طول شورت
+MAX_SECONDS = 175  # حداکثر طول شورت (یوتوب تا ۳ دقیقه قبول می‌کند)
 BUCKET = "media"
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXT = {".mp4", ".mov", ".webm", ".m4v"}
 
 AI_MODEL = "@cf/black-forest-labs/flux-1-schnell"
-MAX_AI_PER_VIDEO = 4  # سقف تصویر AI در هر ویدیو برای حفظ سهمیه‌ی رایگان Workers AI
+AI_STEPS = 8  # حداکثر مرحله‌ی schnell؛ هر تصویر حدود ۱۰۰ neuron
+MAX_AI_PER_VIDEO = 20  # سقف تصویر AI در هر ویدیو (حدود ۲۰۰۰ neuron)
 AI_STYLE = (
-    "cinematic documentary still, realistic, dramatic lighting, vertical composition, "
+    "photorealistic documentary still, vertical composition, "
     "no text, no captions, no logos, no recognizable real person's face"
 )
 
@@ -80,8 +84,8 @@ def supa(method, path, **kwargs):
 
 
 def claim_next():
-    # اولین ویدیوی در صف را برمی‌دارد و وضعیتش را building می‌کند
-    rows = supa("GET", "yt_videos?status=eq.queued&order=id.asc&limit=1")
+    # ویدیوی با بیشترین priority (و بعد قدیمی‌ترین) را برمی‌دارد و وضعیتش را building می‌کند
+    rows = supa("GET", "yt_videos?status=eq.queued&order=priority.desc,id.asc&limit=1")
     if not rows:
         return None
     row = rows[0]
@@ -252,64 +256,80 @@ def pixabay_photo(term, used):
 
 
 # ---------- تصویر AI (Cloudflare Workers AI، FLUX.1 schnell) ----------
-def ai_image(term, sentence, path):
+def ai_image(prompt_core, path):
     if not CF_ACCOUNT_ID or not CF_API_TOKEN:
         return False
     if STATS["ai"] >= MAX_AI_PER_VIDEO:
         return False
-    prompt = f"{term}. Scene: {sentence[:200]}. {AI_STYLE}"
-    try:
-        r = requests.post(
-            f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{AI_MODEL}",
-            headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
-            json={"prompt": prompt[:2000], "steps": 4},
-            timeout=90,
-        )
-        r.raise_for_status()
-        data = base64.b64decode(r.json()["result"]["image"])
-        if len(data) < 5000:
-            print("ai image too small")
-            return False
-        with open(path, "wb") as f:
-            f.write(data)
-        STATS["ai"] += 1
-        print("ai image ok:", term[:50])
-        return True
-    except Exception as e:
-        print("ai image failed:", str(e)[:200])
-        return False
+    prompt = f"{prompt_core}. {AI_STYLE}"
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{AI_MODEL}",
+                headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
+                json={"prompt": prompt[:2000], "steps": AI_STEPS},
+                timeout=120,
+            )
+            if r.status_code in (429, 502, 503, 504):
+                # ظرفیت پر یا خطای موقت؛ کمی صبر و دوباره
+                time.sleep(5 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            data = base64.b64decode(r.json()["result"]["image"])
+            if len(data) < 5000:
+                print("ai image too small")
+                return False
+            with open(path, "wb") as f:
+                f.write(data)
+            STATS["ai"] += 1
+            print("ai image ok:", prompt_core[:60])
+            return True
+        except Exception as e:
+            print("ai image failed:", str(e)[:200])
+            if attempt < 2:
+                time.sleep(3)
+    return False
 
 
-def get_visual(i, term, sentence, used, work):
+def get_visual(i, term, sentence, used, work, image_prompt=None, scene_type="footage"):
     # برمی‌گرداند: مسیر فایل (ویدیو یا عکس)
     clip_path = os.path.join(work, f"c{i}.mp4")
     img_path = os.path.join(work, f"i{i}.jpg")
 
-    # ۱) کلیپ Pixabay با عبارت جستجوی خود صحنه
-    try:
-        link = pixabay_clip(term, used)
-        if link:
-            download(link, clip_path)
-            STATS["stock"] += 1
-            return clip_path
-    except Exception as e:
-        print("pixabay clip failed:", str(e)[:150])
+    def try_clip():
+        try:
+            link = pixabay_clip(term, used)
+            if link:
+                download(link, clip_path)
+                STATS["stock"] += 1
+                return clip_path
+        except Exception as e:
+            print("pixabay clip failed:", str(e)[:150])
+        return None
 
-    # ۲) تصویر AI
-    if ai_image(term, sentence, img_path):
-        return img_path
+    def try_ai():
+        core = image_prompt or f"{term}. Scene: {sentence[:200]}"
+        return img_path if ai_image(core, img_path) else None
 
-    # ۳) عکس Pixabay
-    try:
-        link = pixabay_photo(term, used)
-        if link:
-            download(link, img_path)
-            STATS["stock"] += 1
-            return img_path
-    except Exception as e:
-        print("pixabay photo failed:", str(e)[:150])
+    def try_photo():
+        try:
+            link = pixabay_photo(term, used)
+            if link:
+                download(link, img_path)
+                STATS["stock"] += 1
+                return img_path
+        except Exception as e:
+            print("pixabay photo failed:", str(e)[:150])
+        return None
 
-    # ۴) آخرین راه: کلیپ عمومی
+    # صحنه‌ی illustration: اول تصویر AI؛ صحنه‌ی footage: اول کلیپ
+    order = [try_ai, try_clip, try_photo] if scene_type == "illustration" else [try_clip, try_ai, try_photo]
+    for step in order:
+        got = step()
+        if got:
+            return got
+
+    # آخرین راه: کلیپ عمومی
     for t in FALLBACK_TERMS:
         try:
             link = pixabay_clip(t, used)
@@ -342,7 +362,7 @@ def subtitle_filters(sentence, i, work):
 
 
 # ---------- ساخت صحنه‌ها ----------
-def build_scene(i, sentence, term, work, used, asset=None):
+def build_scene(i, sentence, term, work, used, asset=None, image_prompt=None, scene_type="footage"):
     audio = os.path.join(work, f"s{i}.mp3")
     out = os.path.join(work, f"scene{i}.mp4")
 
@@ -350,7 +370,7 @@ def build_scene(i, sentence, term, work, used, asset=None):
     dur = duration(audio) + 0.3
     subs = subtitle_filters(sentence, i, work)
     if not asset:
-        asset = get_visual(i, term, sentence, used, work)
+        asset = get_visual(i, term, sentence, used, work, image_prompt, scene_type)
     ext = os.path.splitext(asset)[1].lower()
     frames = int(dur * 30) + 2
 
@@ -398,7 +418,11 @@ def build_video(row, work):
     assets = find_assets(row["id"]) if slot_of else {}
     local = {}  # slot → مسیر محلی
     used_names = set()
-    for i, (sentence, term) in enumerate(zip(row["narration"], row["search_terms"])):
+    narration = row["narration"]
+    terms = row["search_terms"]
+    prompts = row.get("image_prompts") or []
+    types = row.get("scene_types") or []
+    for i, (sentence, term) in enumerate(zip(narration, terms)):
         slot = slot_of.get(i)
         asset_path = None
         if slot in assets:
@@ -406,9 +430,12 @@ def build_video(row, work):
                 local[slot] = download_asset(assets[slot], work)
             asset_path = local[slot]
             used_names.add(assets[slot])
-        path, dur = build_scene(i, sentence, term, work, used, asset_path)
+        prompt = prompts[i] if i < len(prompts) else None
+        stype = types[i] if i < len(types) and types[i] in ("footage", "illustration") else "footage"
+        path, dur = build_scene(i, sentence, term, work, used, asset_path, prompt, stype)
         scenes.append(path)
         total += dur
+        print(f"scene {i + 1}/{len(narration)} done ({stype}), total {total:.0f}s")
     if total > MAX_SECONDS:
         raise RuntimeError(f"video too long: {total:.0f}s")
 
