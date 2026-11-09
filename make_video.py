@@ -1,6 +1,8 @@
 # ساخت یک ویدیوی شورت از صف Supabase و آپلود خصوصی در یوتوب
-# نسخه ۲: عکس/ویدیوی خود مهدی از باکت media + فونت Poppins + حذف خودکار فایل‌های استفاده‌شده
+# نسخه ۳: ترتیب تصویر هر صحنه: ۱) کلیپ Pixabay ۲) تصویر AI (Cloudflare FLUX) با زوم ۳) عکس Pixabay ۴) کلیپ عمومی
+# عکس/ویدیوی خود مهدی از باکت media (اختیاری) همچنان اولویت اول دارد
 import asyncio
+import base64
 import os
 import random
 import re
@@ -13,11 +15,15 @@ import time
 import requests
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 PIXABAY_KEY = os.environ["PIXABAY_API_KEY"]
+# اختیاری: اگر نباشند، تصویر AI رد می‌شود و بقیه مراحل کار می‌کنند
+CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "").strip()
+CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
 
 VOICE = "en-US-AndrewNeural"
 FONT_FALLBACK = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -28,6 +34,16 @@ MAX_SECONDS = 170  # حداکثر طول شورت
 BUCKET = "media"
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXT = {".mp4", ".mov", ".webm", ".m4v"}
+
+AI_MODEL = "@cf/black-forest-labs/flux-1-schnell"
+MAX_AI_PER_VIDEO = 4  # سقف تصویر AI در هر ویدیو برای حفظ سهمیه‌ی رایگان Workers AI
+AI_STYLE = (
+    "cinematic documentary still, realistic, dramatic lighting, vertical composition, "
+    "no text, no captions, no logos, no recognizable real person's face"
+)
+
+# آمار این اجرا (برای نوشتن منبع‌ها در توضیحات)
+STATS = {"stock": 0, "ai": 0}
 
 
 # ---------- فونت ----------
@@ -181,6 +197,14 @@ def duration(path):
 
 
 # ---------- Pixabay ----------
+def download(url, path):
+    with requests.get(url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(1024 * 256):
+                f.write(chunk)
+
+
 def pixabay_clip(term, used):
     r = requests.get(
         "https://pixabay.com/api/videos/",
@@ -191,33 +215,111 @@ def pixabay_clip(term, used):
     hits = r.json().get("hits", [])
     random.shuffle(hits)
     for h in hits:
-        if h["id"] in used:
+        key = ("v", h["id"])
+        if key in used:
             continue
         videos = h.get("videos", {})
         for size in ("large", "medium"):
             v = videos.get(size) or {}
             # از فایل‌های خیلی حجیم صرف‌نظر می‌کنیم
             if v.get("url") and v.get("size", 0) < 60_000_000:
-                used.add(h["id"])
+                used.add(key)
                 return v["url"]
     return None
 
 
-def download(url, path):
-    with requests.get(url, stream=True, timeout=120) as r:
-        r.raise_for_status()
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(1024 * 256):
-                f.write(chunk)
-
-
-def get_clip(term, used, path):
-    for t in [term] + FALLBACK_TERMS:
-        link = pixabay_clip(t, used)
+def pixabay_photo(term, used):
+    r = requests.get(
+        "https://pixabay.com/api/",
+        params={
+            "key": PIXABAY_KEY, "q": term[:100], "image_type": "photo",
+            "orientation": "vertical", "per_page": 20, "safesearch": "true",
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    hits = r.json().get("hits", [])
+    random.shuffle(hits)
+    for h in hits:
+        key = ("p", h["id"])
+        if key in used:
+            continue
+        link = h.get("largeImageURL") or h.get("webformatURL")
         if link:
-            download(link, path)
-            return
-    raise RuntimeError(f"no clip found for: {term}")
+            used.add(key)
+            return link
+    return None
+
+
+# ---------- تصویر AI (Cloudflare Workers AI، FLUX.1 schnell) ----------
+def ai_image(term, sentence, path):
+    if not CF_ACCOUNT_ID or not CF_API_TOKEN:
+        return False
+    if STATS["ai"] >= MAX_AI_PER_VIDEO:
+        return False
+    prompt = f"{term}. Scene: {sentence[:200]}. {AI_STYLE}"
+    try:
+        r = requests.post(
+            f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{AI_MODEL}",
+            headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
+            json={"prompt": prompt[:2000], "steps": 4},
+            timeout=90,
+        )
+        r.raise_for_status()
+        data = base64.b64decode(r.json()["result"]["image"])
+        if len(data) < 5000:
+            print("ai image too small")
+            return False
+        with open(path, "wb") as f:
+            f.write(data)
+        STATS["ai"] += 1
+        print("ai image ok:", term[:50])
+        return True
+    except Exception as e:
+        print("ai image failed:", str(e)[:200])
+        return False
+
+
+def get_visual(i, term, sentence, used, work):
+    # برمی‌گرداند: مسیر فایل (ویدیو یا عکس)
+    clip_path = os.path.join(work, f"c{i}.mp4")
+    img_path = os.path.join(work, f"i{i}.jpg")
+
+    # ۱) کلیپ Pixabay با عبارت جستجوی خود صحنه
+    try:
+        link = pixabay_clip(term, used)
+        if link:
+            download(link, clip_path)
+            STATS["stock"] += 1
+            return clip_path
+    except Exception as e:
+        print("pixabay clip failed:", str(e)[:150])
+
+    # ۲) تصویر AI
+    if ai_image(term, sentence, img_path):
+        return img_path
+
+    # ۳) عکس Pixabay
+    try:
+        link = pixabay_photo(term, used)
+        if link:
+            download(link, img_path)
+            STATS["stock"] += 1
+            return img_path
+    except Exception as e:
+        print("pixabay photo failed:", str(e)[:150])
+
+    # ۴) آخرین راه: کلیپ عمومی
+    for t in FALLBACK_TERMS:
+        try:
+            link = pixabay_clip(t, used)
+            if link:
+                download(link, clip_path)
+                STATS["stock"] += 1
+                return clip_path
+        except Exception as e:
+            print("fallback clip failed:", str(e)[:150])
+    raise RuntimeError(f"no visual found for: {term}")
 
 
 # ---------- زیرنویس ----------
@@ -247,15 +349,17 @@ def build_scene(i, sentence, term, work, used, asset=None):
     make_audio(sentence, audio)
     dur = duration(audio) + 0.3
     subs = subtitle_filters(sentence, i, work)
-    ext = os.path.splitext(asset)[1].lower() if asset else ""
+    if not asset:
+        asset = get_visual(i, term, sentence, used, work)
+    ext = os.path.splitext(asset)[1].lower()
     frames = int(dur * 30) + 2
 
-    if asset and ext in IMAGE_EXT:
-        # عکس مهدی: پس‌زمینه‌ی محو + خود عکس کامل وسط + زوم آرام (جهت زوم یکی در میان عوض می‌شود)
+    if ext in IMAGE_EXT:
+        # عکس: پس‌زمینه‌ی محو + خود عکس کامل وسط + زوم آرام (جهت زوم یکی در میان عوض می‌شود)
         if i % 2 == 0:
-            zoom = f"min(1+0.0007*on,1.18)"
+            zoom = "min(1+0.0007*on,1.18)"
         else:
-            zoom = f"max(1.18-0.0007*on,1.0)"
+            zoom = "max(1.18-0.0007*on,1.0)"
         fc = (
             "[0:v]split[a][b];"
             "[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=40:6,eq=brightness=-0.08[bg];"
@@ -271,15 +375,10 @@ def build_scene(i, sentence, term, work, used, asset=None):
             "-map", "[v]", "-map", "1:a",
         ]
     else:
-        if asset:
-            clip = asset  # ویدیوی مهدی
-        else:
-            clip = os.path.join(work, f"c{i}.mp4")
-            get_clip(term, used, clip)
         filters = ["scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30"] + subs
         cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
-            "-stream_loop", "-1", "-i", clip, "-i", audio,
+            "-stream_loop", "-1", "-i", asset, "-i", audio,
             "-t", f"{dur:.2f}", "-vf", ",".join(filters), "-af", "apad",
             "-map", "0:v", "-map", "1:a",
         ]
@@ -299,7 +398,6 @@ def build_video(row, work):
     assets = find_assets(row["id"]) if slot_of else {}
     local = {}  # slot → مسیر محلی
     used_names = set()
-    stock_used = False
     for i, (sentence, term) in enumerate(zip(row["narration"], row["search_terms"])):
         slot = slot_of.get(i)
         asset_path = None
@@ -308,8 +406,6 @@ def build_video(row, work):
                 local[slot] = download_asset(assets[slot], work)
             asset_path = local[slot]
             used_names.add(assets[slot])
-        else:
-            stock_used = True
         path, dur = build_scene(i, sentence, term, work, used, asset_path)
         scenes.append(path)
         total += dur
@@ -328,12 +424,12 @@ def build_video(row, work):
         ],
         check=True,
     )
-    print(f"video ready: {total:.0f}s; own media: {sorted(used_names)}")
-    return final, sorted(used_names), stock_used
+    print(f"video ready: {total:.0f}s; own media: {sorted(used_names)}; stats: {STATS}")
+    return final, sorted(used_names)
 
 
 # ---------- آپلود در یوتوب (خصوصی) ----------
-def upload(row, path, own_media, stock_used):
+def upload(row, path, own_media):
     creds = Credentials(
         None,
         refresh_token=os.environ["YT_REFRESH_TOKEN"],
@@ -350,8 +446,13 @@ def upload(row, path, own_media, stock_used):
     credits = []
     if own_media:
         credits.append("Images: Wikimedia Commons and other freely licensed sources")
-    if stock_used:
-        credits.append("Stock footage: Pixabay")
+    if STATS["stock"]:
+        credits.append("Stock footage and photos: Pixabay")
+    if STATS["ai"]:
+        credits.append(
+            "Some images are AI-generated illustrations (Cloudflare Workers AI, FLUX.1 schnell) "
+            "and are illustrative, not real photographs."
+        )
     desc = row["description"].strip() + "\n\n" + "\n".join(credits) + "\n#Shorts"
     body = {
         "snippet": {
@@ -365,12 +466,26 @@ def upload(row, path, own_media, stock_used):
             "selfDeclaredMadeForKids": False,
         },
     }
-    media = MediaFileUpload(path, mimetype="video/mp4", chunksize=-1, resumable=True)
-    request = yt.videos().insert(part="snippet,status", body=body, media_body=media)
-    response = None
-    while response is None:
-        _, response = request.next_chunk()
-    return response["id"]
+    # اعلام محتوای مصنوعی وقتی تصویر AI استفاده شده؛ اگر API این فیلد را نپذیرفت بدونش دوباره تلاش می‌کنیم
+    if STATS["ai"]:
+        body["status"]["containsSyntheticMedia"] = True
+
+    def do_upload(b):
+        media = MediaFileUpload(path, mimetype="video/mp4", chunksize=-1, resumable=True)
+        request = yt.videos().insert(part="snippet,status", body=b, media_body=media)
+        response = None
+        while response is None:
+            _, response = request.next_chunk()
+        return response["id"]
+
+    try:
+        return do_upload(body)
+    except HttpError as e:
+        if "containsSyntheticMedia" in body["status"] and getattr(e.resp, "status", 0) == 400:
+            print("containsSyntheticMedia rejected, retrying without it:", str(e)[:200])
+            body["status"].pop("containsSyntheticMedia")
+            return do_upload(body)
+        raise
 
 
 def main():
@@ -382,8 +497,8 @@ def main():
     try:
         with tempfile.TemporaryDirectory() as work:
             setup_font(work)
-            final, own_media, stock_used = build_video(row, work)
-            video_id = upload(row, final, own_media, stock_used)
+            final, own_media = build_video(row, work)
+            video_id = upload(row, final, own_media)
         supa(
             "PATCH",
             f"yt_videos?id=eq.{row['id']}",
