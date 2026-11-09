@@ -28,6 +28,11 @@ PIXABAY_KEY = os.environ["PIXABAY_API_KEY"]
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "").strip()
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "").strip()
 
+# وضعیت انتشار: فقط وقتی دستی از تب Actions «public» انتخاب شود عمومی می‌شود؛ اجرای خودکار (cron) همیشه private است
+PRIVACY = os.environ.get("PRIVACY", "private").strip().lower()
+if PRIVACY not in ("private", "public"):
+    PRIVACY = "private"
+
 VOICE = "en-US-AndrewNeural"
 FONT_FALLBACK = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 FONT_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/poppins/Poppins-ExtraBold.ttf"
@@ -489,7 +494,7 @@ def upload(row, path, own_media):
             "categoryId": "27",  # Education
         },
         "status": {
-            "privacyStatus": "private",
+            "privacyStatus": PRIVACY,
             "selfDeclaredMadeForKids": False,
         },
     }
@@ -531,7 +536,7 @@ def main():
             f"yt_videos?id=eq.{row['id']}",
             json={"status": "uploaded", "youtube_id": video_id},
         )
-        print("uploaded (private):", video_id)
+        print(f"uploaded ({PRIVACY}):", video_id)
         # حذف خودکار فقط فایل‌هایی که واقعاً در این ویدیو استفاده شدند
         delete_assets(own_media)
     except Exception as e:
