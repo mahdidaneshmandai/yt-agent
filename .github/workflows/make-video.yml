@@ -1,10 +1,20 @@
-# ساخت و آپلود خصوصی یک ویدیو؛ هر روز خودکار و همچنین دستی از تب Actions
+# ساخت و آپلود یک ویدیو
+# - اجرای خودکار روزانه (cron): هر روز ساعت ۷ UTC یک ویدیو می‌سازد و public منتشر می‌کند، حتی اگر تو آنلاین نباشی
+# - اجرای دستی از تب Actions: می‌توانی privacy را روی private بگذاری (پیش‌فرض public است)
 name: make-video
 
 on:
   schedule:
     - cron: "0 7 * * *"
   workflow_dispatch:
+    inputs:
+      privacy:
+        description: "وضعیت انتشار ویدیو"
+        type: choice
+        default: public
+        options:
+          - public
+          - private
 
 jobs:
   build:
@@ -26,6 +36,7 @@ jobs:
       - name: Build and upload one video
         run: python make_video.py
         env:
+          PRIVACY: ${{ inputs.privacy || 'public' }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
