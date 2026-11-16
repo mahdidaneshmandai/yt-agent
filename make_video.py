@@ -1,7 +1,11 @@
-# ساخت یک ویدیوی شورت بلند از صف Supabase و آپلود خصوصی در یوتوب
-# نسخه ۴: ویدیوی ۹۰ تا ۱۳۰ ثانیه‌ای، روزی یکی
+# ساخت یک ویدیوی شورت از صف Supabase و آپلود در یوتوب
+# نسخه ۵:
+#  - کپشن کلمه‌به‌کلمه با زمان‌بندی دقیق خود edge-tts (بدون نیاز به Whisper)
+#  - نوار پیشرفت بالای ویدیو (قطعه‌به‌قطعه: 1/N ... N/N)
+#  - برچسب کوتاه هر صحنه (labels) و مهر بزرگ روی نکته‌ی اصلی (stamps)
+#  - نام سری به‌عنوان برند ثابت گوشه‌ی بالا
+#  - هر قابلیت جدید اگر خراب شود، به رفتار قبلی برمی‌گردد (ویدیو هیچ‌وقت به‌خاطر ظاهر خراب نمی‌شود)
 #  - هر صحنه نوع دارد: footage (کلیپ Pixabay اول) یا illustration (تصویر AI اول)
-#  - تصویر AI: Cloudflare FLUX.1 schnell با ۸ مرحله و زوم آرام
 #  - ردیف‌های با priority بالاتر زودتر ساخته می‌شوند
 # عکس/ویدیوی خود مهدی از باکت media (اختیاری) همچنان اولویت اول دارد
 import asyncio
@@ -50,6 +54,21 @@ AI_STYLE = (
     "photorealistic documentary still, vertical composition, "
     "no text, no captions, no logos, no recognizable real person's face"
 )
+
+# ---------- تنظیمات ظاهر (رنگ‌ها و اندازه‌ها) ----------
+ACCENT = "0xF2994A"  # نارنجی برند
+CAPTION_FONTSIZE = 84
+CAPTION_MAX_CHARS = 17  # حداکثر حرف در هر تکه‌ی کپشن
+CAPTION_MAX_WORDS = 3  # حداکثر کلمه در هر تکه‌ی کپشن
+BAR_Y, BAR_H = 70, 12  # جای نوار پیشرفت
+BRAND_Y = 108
+LABEL_Y = 190
+STAMP_Y = 470
+CAPTION_Y = 1130  # بالاتر از ناحیه‌ی دکمه‌های یوتوب
+STAMP_COLORS = {
+    "TRUE": "0x2E9E5B", "FREE": "0x2E9E5B", "REAL": "0x2E9E5B", "CONFIRMED": "0x2E9E5B",
+    "FALSE": "0xD64545", "BANNED": "0xD64545", "MYTH": "0xD64545", "FAKE": "0xD64545",
+}
 
 # آمار این اجرا (برای نوشتن منبع‌ها در توضیحات)
 STATS = {"stock": 0, "ai": 0}
@@ -175,17 +194,34 @@ def sentence_slots(row):
 
 # ---------- صدا ----------
 async def _edge_tts(text, path):
+    # صدا را می‌نویسد و زمان شروع/پایان هر کلمه را هم برمی‌گرداند
+    # edge-tts نسخه ۷ به‌طور پیش‌فرض فقط زمان جمله می‌دهد؛ boundary را صریح می‌دهیم
     import edge_tts
 
-    await edge_tts.Communicate(text, VOICE, rate="+4%").save(path)
+    try:
+        com = edge_tts.Communicate(text, VOICE, rate="+4%", boundary="WordBoundary")
+    except TypeError:
+        com = edge_tts.Communicate(text, VOICE, rate="+4%")
+    words = []
+    with open(path, "wb") as f:
+        async for chunk in com.stream():
+            kind = chunk.get("type")
+            if kind == "audio":
+                f.write(chunk["data"])
+            elif kind == "WordBoundary":
+                start = chunk["offset"] / 1e7  # واحد ۱۰۰ نانوثانیه
+                end = start + chunk["duration"] / 1e7
+                words.append((chunk["text"], start, end))
+    return words
 
 
 def make_audio(text, path):
+    # برمی‌گرداند: فهرست (کلمه، شروع، پایان)؛ اگر زمان کلمه‌ها نبود، فهرست خالی
     for attempt in range(3):
         try:
-            asyncio.run(_edge_tts(text, path))
+            words = asyncio.run(_edge_tts(text, path))
             if os.path.getsize(path) > 1000:
-                return
+                return words
         except Exception as e:
             print("edge-tts failed:", e)
             time.sleep(2)
@@ -193,6 +229,7 @@ def make_audio(text, path):
     from gtts import gTTS
 
     gTTS(text, lang="en", tld="com").save(path)
+    return []
 
 
 def duration(path):
@@ -347,16 +384,60 @@ def get_visual(i, term, sentence, used, work, image_prompt=None, scene_type="foo
     raise RuntimeError(f"no visual found for: {term}")
 
 
-# ---------- زیرنویس ----------
+# ---------- لایه‌های ظاهری (همه با drawtext/drawbox؛ هر متن در فایل جدا) ----------
+def _text_file(work, name, text):
+    path = os.path.join(work, name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
+def caption_chunks(words):
+    # کلمه‌ها را به تکه‌های ۱ تا ۳ کلمه‌ای تقسیم می‌کند؛ هر تکه تا شروع تکه‌ی بعد روی صفحه می‌ماند
+    chunks, cur = [], []
+    for w in words:
+        text = w[0].strip()
+        if not text:
+            continue
+        cur_text = " ".join(x[0] for x in cur)
+        too_long = len(cur_text) + 1 + len(text) > CAPTION_MAX_CHARS
+        if cur and (len(cur) >= CAPTION_MAX_WORDS or too_long):
+            chunks.append(cur)
+            cur = []
+        cur.append((text, w[1], w[2]))
+        if text[-1] in ".,?!;:":
+            chunks.append(cur)
+            cur = []
+    if cur:
+        chunks.append(cur)
+    out = []
+    for k, ch in enumerate(chunks):
+        start = ch[0][1]
+        end = chunks[k + 1][0][1] if k + 1 < len(chunks) else ch[-1][2] + 0.25
+        out.append((" ".join(x[0] for x in ch), start, end))
+    return out
+
+
+def word_caption_filters(words, i, work):
+    out = []
+    for k, (text, start, end) in enumerate(caption_chunks(words)):
+        path = _text_file(work, f"w{i}_{k}.txt", text)
+        out.append(
+            f"drawtext=fontfile={FONT}:textfile={path}:expansion=none:"
+            f"fontcolor=white:fontsize={CAPTION_FONTSIZE}:borderw=6:bordercolor=black@0.95:"
+            "shadowcolor=black@0.6:shadowx=0:shadowy=5:"
+            f"x=(w-text_w)/2:y={CAPTION_Y}:enable='between(t,{start:.3f},{end:.3f})'"
+        )
+    return out
+
+
 def subtitle_filters(sentence, i, work):
-    # هر خط زیرنویس یک drawtext جداست تا کاراکتر خط جدید به شکل مربع نمایش داده نشود
+    # راه جایگزین (وقتی زمان کلمه‌ها نیست): هر خط زیرنویس یک drawtext جداست
     lines = textwrap.wrap(sentence, width=22)
     out = []
     y0 = int(1200 - len(lines) * 55)
     for j, line in enumerate(lines):
-        line_file = os.path.join(work, f"t{i}_{j}.txt")
-        with open(line_file, "w", encoding="utf-8") as f:
-            f.write(line)
+        line_file = _text_file(work, f"t{i}_{j}.txt", line)
         out.append(
             f"drawtext=fontfile={FONT}:textfile={line_file}:expansion=none:"
             "fontcolor=white:fontsize=66:borderw=5:bordercolor=black@0.95:"
@@ -366,19 +447,82 @@ def subtitle_filters(sentence, i, work):
     return out
 
 
-# ---------- ساخت صحنه‌ها ----------
-def build_scene(i, sentence, term, work, used, asset=None, image_prompt=None, scene_type="footage"):
-    audio = os.path.join(work, f"s{i}.mp3")
-    out = os.path.join(work, f"scene{i}.mp4")
+def progress_filters(i, n):
+    # نوار پیشرفت: n قطعه؛ قطعه‌های تا صحنه‌ی فعلی نارنجی، بقیه کمرنگ
+    if n < 1:
+        return []
+    margin, gap = 60, 6
+    seg = max(8, (1080 - 2 * margin - gap * (n - 1)) // n)
+    out = []
+    for k in range(n):
+        color = ACCENT if k <= i else "white@0.30"
+        out.append(
+            f"drawbox=x={margin + k * (seg + gap)}:y={BAR_Y}:w={seg}:h={BAR_H}:color={color}:t=fill"
+        )
+    return out
 
-    make_audio(sentence, audio)
-    dur = duration(audio) + 0.3
-    subs = subtitle_filters(sentence, i, work)
-    if not asset:
-        asset = get_visual(i, term, sentence, used, work, image_prompt, scene_type)
+
+def brand_filters(series, i, work):
+    if not series:
+        return []
+    path = _text_file(work, f"b{i}.txt", series.upper()[:28])
+    return [
+        f"drawtext=fontfile={FONT}:textfile={path}:expansion=none:fontcolor={ACCENT}:"
+        f"fontsize=34:borderw=3:bordercolor=black@0.9:x=60:y={BRAND_Y}"
+    ]
+
+
+def label_filters(label, i, work):
+    if not label:
+        return []
+    path = _text_file(work, f"l{i}.txt", label.upper()[:32])
+    return [
+        f"drawtext=fontfile={FONT}:textfile={path}:expansion=none:fontcolor=white:fontsize=44:"
+        "box=1:boxcolor=black@0.55:boxborderw=18:"
+        f"x=(w-text_w)/2:y={LABEL_Y}"
+    ]
+
+
+def stamp_filters(stamp, i, work, dur):
+    # مهر بزرگ روی نکته‌ی اصلی؛ بعد از ۰.۳ ثانیه تا آخر صحنه می‌ماند
+    if not stamp:
+        return []
+    text = stamp.upper()[:14]
+    color = STAMP_COLORS.get(text, ACCENT)
+    path = _text_file(work, f"s{i}_stamp.txt", text)
+    return [
+        f"drawtext=fontfile={FONT}:textfile={path}:expansion=none:fontcolor=white:fontsize=130:"
+        f"box=1:boxcolor={color}@0.92:boxborderw=28:"
+        f"x=(w-text_w)/2:y={STAMP_Y}:enable='between(t,0.3,{dur:.2f})'"
+    ]
+
+
+def overlay_filters(sentence, words, i, n, series, label, stamp, work, dur):
+    # همه‌ی لایه‌های روی تصویر به ترتیب: نوار، برند، برچسب، مهر، کپشن
+    layers = []
+    try:
+        layers += progress_filters(i, n)
+        layers += brand_filters(series, i, work)
+        layers += label_filters(label, i, work)
+        layers += stamp_filters(stamp, i, work, dur)
+    except Exception as e:
+        print("overlay layers failed, skipping them:", str(e)[:150])
+        layers = []
+    caps = []
+    if words:
+        try:
+            caps = word_caption_filters(words, i, work)
+        except Exception as e:
+            print("word captions failed, using sentence captions:", str(e)[:150])
+    if not caps:
+        caps = subtitle_filters(sentence, i, work)
+    return layers + caps
+
+
+# ---------- ساخت صحنه‌ها ----------
+def run_scene_ffmpeg(asset, audio, dur, overlays, i, out):
     ext = os.path.splitext(asset)[1].lower()
     frames = int(dur * 30) + 2
-
     if ext in IMAGE_EXT:
         # عکس: پس‌زمینه‌ی محو + خود عکس کامل وسط + زوم آرام (جهت زوم یکی در میان عوض می‌شود)
         if i % 2 == 0:
@@ -391,7 +535,7 @@ def build_scene(i, sentence, term, work, used, asset=None, image_prompt=None, sc
             "[b]scale=1080:1920:force_original_aspect_ratio=decrease[fg];"
             "[bg][fg]overlay=(W-w)/2:(H-h)/2,"
             f"zoompan=z='{zoom}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1080x1920:fps=30,"
-            + ",".join(subs)
+            + ",".join(overlays)
             + "[v]"
         )
         cmd = [
@@ -400,7 +544,7 @@ def build_scene(i, sentence, term, work, used, asset=None, image_prompt=None, sc
             "-map", "[v]", "-map", "1:a",
         ]
     else:
-        filters = ["scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30"] + subs
+        filters = ["scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,fps=30"] + overlays
         cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
             "-stream_loop", "-1", "-i", asset, "-i", audio,
@@ -413,7 +557,33 @@ def build_scene(i, sentence, term, work, used, asset=None, image_prompt=None, sc
         out,
     ]
     subprocess.run(cmd, check=True)
+
+
+def build_scene(i, sentence, term, work, used, asset=None, image_prompt=None,
+                scene_type="footage", n=0, series="", label="", stamp=""):
+    audio = os.path.join(work, f"s{i}.mp3")
+    out = os.path.join(work, f"scene{i}.mp4")
+
+    words = make_audio(sentence, audio)
+    dur = duration(audio) + 0.3
+    if not asset:
+        asset = get_visual(i, term, sentence, used, work, image_prompt, scene_type)
+
+    overlays = overlay_filters(sentence, words, i, n, series, label, stamp, work, dur)
+    try:
+        run_scene_ffmpeg(asset, audio, dur, overlays, i, out)
+    except subprocess.CalledProcessError:
+        # اگر لایه‌های جدید خطا دادند، با زیرنویس ساده‌ی قبلی دوباره می‌سازیم
+        print(f"scene {i}: overlay render failed, retrying with plain subtitles")
+        run_scene_ffmpeg(asset, audio, dur, subtitle_filters(sentence, i, work), i, out)
     return out, dur
+
+
+def _at(arr, i):
+    # عنصر i ام فهرست یا رشته‌ی خالی؛ ‎null‎ و کوتاه‌بودن فهرست را تحمل می‌کند
+    if arr and i < len(arr) and arr[i]:
+        return str(arr[i]).strip()
+    return ""
 
 
 def build_video(row, work):
@@ -427,6 +597,10 @@ def build_video(row, work):
     terms = row["search_terms"]
     prompts = row.get("image_prompts") or []
     types = row.get("scene_types") or []
+    labels = row.get("labels") or []
+    stamps = row.get("stamps") or []
+    series = (row.get("series") or "").strip()
+    n = len(narration)
     for i, (sentence, term) in enumerate(zip(narration, terms)):
         slot = slot_of.get(i)
         asset_path = None
@@ -437,10 +611,13 @@ def build_video(row, work):
             used_names.add(assets[slot])
         prompt = prompts[i] if i < len(prompts) else None
         stype = types[i] if i < len(types) and types[i] in ("footage", "illustration") else "footage"
-        path, dur = build_scene(i, sentence, term, work, used, asset_path, prompt, stype)
+        path, dur = build_scene(
+            i, sentence, term, work, used, asset_path, prompt, stype,
+            n=n, series=series, label=_at(labels, i), stamp=_at(stamps, i),
+        )
         scenes.append(path)
         total += dur
-        print(f"scene {i + 1}/{len(narration)} done ({stype}), total {total:.0f}s")
+        print(f"scene {i + 1}/{n} done ({stype}), total {total:.0f}s")
     if total > MAX_SECONDS:
         raise RuntimeError(f"video too long: {total:.0f}s")
 
@@ -460,7 +637,7 @@ def build_video(row, work):
     return final, sorted(used_names)
 
 
-# ---------- آپلود در یوتوب (خصوصی) ----------
+# ---------- آپلود در یوتوب ----------
 def upload(row, path, own_media):
     creds = Credentials(
         None,
