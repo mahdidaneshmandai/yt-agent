@@ -8,7 +8,7 @@
 #  - هر صحنه نوع دارد: footage (کلیپ Pixabay اول) یا illustration (تصویر AI اول)
 #  - ردیف‌های با priority بالاتر زودتر ساخته می‌شوند
 # نسخه ۶ (autopilot): اگر صف خالی باشد خودش سناریو می‌نویسد؛ بعد از ساخت، ویدیو را به باکت عمومی reels می‌دهد
-#  و با Instagram Graph API (رایگان) به‌صورت ریل منتشر می‌کند؛ اگر اینستا خراب شود دفعه‌ی بعد دوباره تلاش می‌کند
+#  و آدرسش را به webhook رایگان Make می‌فرستد تا ریل اینستاگرام شود؛ اگر اینستا خراب شود دفعه‌ی بعد دوباره تلاش می‌کند
 # عکس/ویدیوی خود مهدی از باکت media (اختیاری) همچنان اولویت اول دارد
 import asyncio
 import base64
@@ -795,11 +795,9 @@ def ensure_queue():
         generate_script()
 
 
-# ---------- اینستاگرام (Supabase Storage عمومی + Instagram Graph API رایگان) ----------
+# ---------- اینستاگرام (Supabase Storage عمومی + webhook رایگان Make) ----------
 REELS_BUCKET = "reels"
-IG_USER_ID = os.environ.get("IG_USER_ID", "").strip()
-IG_TOKEN_ENV = os.environ.get("IG_ACCESS_TOKEN", "").strip()
-IG_API = "https://graph.instagram.com/v21.0"
+MAKE_WEBHOOK_URL = os.environ.get("MAKE_WEBHOOK_URL", "").strip()
 
 
 def shrink_for_storage(path, work):
@@ -838,92 +836,10 @@ def ig_caption(row):
     return f"{row['title'].strip()}\n\n{desc}\n\n{hashtags} #reels #facts #history".strip()[:2000]
 
 
-def kv_get(key):
-    rows = supa("GET", f"kv?key=eq.{key}&select=value") or []
-    return rows[0]["value"] if rows else None
-
-
-def kv_set(key, value):
-    supa(
-        "POST",
-        "kv?on_conflict=key",
-        json={"key": key, "value": value, "updated_at": datetime.utcnow().isoformat() + "Z"},
-        headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
-    )
-
-
-def ig_token():
-    # توکن اینستاگرام ۶۰ روز اعتبار دارد؛ هر اجرا آن را تمدید می‌کنیم و نسخه‌ی جدید را در Supabase نگه می‌داریم
-    if not (IG_USER_ID and IG_TOKEN_ENV):
-        return None
-    seed = IG_TOKEN_ENV[-12:]
-    tok = IG_TOKEN_ENV
-    saved = kv_get("ig_token")
-    if saved and saved.startswith(seed + "|"):
-        tok = saved.split("|", 1)[1]
-    try:
-        r = requests.get(
-            "https://graph.instagram.com/refresh_access_token",
-            params={"grant_type": "ig_refresh_token", "access_token": tok},
-            timeout=60,
-        )
-        if r.status_code == 200 and r.json().get("access_token"):
-            tok = r.json()["access_token"]
-        else:
-            print("ig token refresh skipped:", r.status_code, r.text[:150])
-    except Exception as e:
-        print("ig token refresh error:", str(e)[:150])
-    kv_set("ig_token", seed + "|" + tok)
-    return tok
-
-
-def schedule_instagram(row, url, tok):
-    caption = ig_caption(row)
-    if STATS["ai"]:
-        caption = caption[:1900] + "\n\nSome visuals are AI-generated illustrations."
-    r = requests.post(
-        f"{IG_API}/{IG_USER_ID}/media",
-        data={
-            "media_type": "REELS",
-            "video_url": url,
-            "caption": caption,
-            "share_to_feed": "true",
-            "access_token": tok,
-        },
-        timeout=120,
-    )
-    if r.status_code >= 300:
-        raise RuntimeError(f"ig create {r.status_code}: {r.text[:300]}")
-    cid = r.json()["id"]
-    for _ in range(60):  # حداکثر ۱۵ دقیقه صبر برای پردازش
-        time.sleep(15)
-        st = requests.get(
-            f"{IG_API}/{cid}",
-            params={"fields": "status_code,status", "access_token": tok},
-            timeout=60,
-        ).json()
-        code = st.get("status_code")
-        if code == "FINISHED":
-            break
-        if code in ("ERROR", "EXPIRED"):
-            raise RuntimeError(f"ig processing {code}: {str(st)[:300]}")
-    else:
-        raise RuntimeError("ig processing timeout")
-    p = requests.post(
-        f"{IG_API}/{IG_USER_ID}/media_publish",
-        data={"creation_id": cid, "access_token": tok},
-        timeout=120,
-    )
-    if p.status_code >= 300:
-        raise RuntimeError(f"ig publish {p.status_code}: {p.text[:300]}")
-    return str(p.json().get("id", ""))
-
-
 def post_pending_instagram():
-    # هر ویدیوی آپلودشده که هنوز در اینستا زمان‌بندی نشده (یا قبلاً خطا داده) را می‌فرستد
-    tok = ig_token()
-    if not tok:
-        print("instagram skipped: no IG secrets")
+    # هر ویدیوی آپلودشده که هنوز به Make نرفته (یا قبلاً خطا داده) را به webhook می‌فرستد؛ Make آن را ریل می‌کند
+    if not MAKE_WEBHOOK_URL:
+        print("instagram skipped: no MAKE_WEBHOOK_URL")
         return
     rows = supa(
         "GET",
@@ -932,19 +848,27 @@ def post_pending_instagram():
     ) or []
     for row in rows:
         try:
-            pid = schedule_instagram(row, row["video_url"], tok)
+            caption = ig_caption(row)
+            if STATS["ai"]:
+                caption = caption[:1900] + "\n\nSome visuals are AI-generated illustrations."
+            r = requests.post(
+                MAKE_WEBHOOK_URL,
+                json={
+                    "id": row["id"],
+                    "title": row["title"],
+                    "caption": caption,
+                    "video_url": row["video_url"],
+                },
+                timeout=60,
+            )
+            if r.status_code >= 300:
+                raise RuntimeError(f"make webhook {r.status_code}: {r.text[:200]}")
             supa(
                 "PATCH",
                 f"yt_videos?id=eq.{row['id']}",
-                json={"ig_status": "published", "ig_post_id": pid, "ig_error": None},
+                json={"ig_status": "sent", "ig_error": None},
             )
-            print("instagram published:", row["id"], pid)
-            # بعد از انتشار فایل موقت را پاک می‌کنیم تا فضا پر نشود
-            requests.delete(
-                f"{SUPABASE_URL}/storage/v1/object/{REELS_BUCKET}/{row['id']}.mp4",
-                headers=storage_headers(),
-                timeout=60,
-            )
+            print("instagram sent to Make:", row["id"])
         except Exception as e:
             supa(
                 "PATCH",
@@ -952,6 +876,21 @@ def post_pending_instagram():
                 json={"ig_status": "failed", "ig_error": str(e)[:500]},
             )
             print("instagram failed:", row["id"], str(e)[:200])
+    cleanup_old_reels()
+
+
+def cleanup_old_reels():
+    # آخرین ۵ فایل را نگه می‌داریم (تا Make فرصت دانلود داشته باشد)، بقیه را پاک می‌کنیم تا فضا پر نشود
+    old = supa("GET", "yt_videos?select=id&video_url=not.is.null&order=id.desc&offset=5&limit=100") or []
+    for o in old:
+        try:
+            requests.delete(
+                f"{SUPABASE_URL}/storage/v1/object/{REELS_BUCKET}/{o['id']}.mp4",
+                headers=storage_headers(),
+                timeout=60,
+            )
+        except Exception:
+            pass
 
 
 def main():
