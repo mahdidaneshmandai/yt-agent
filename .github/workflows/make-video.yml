@@ -1,4 +1,4 @@
-# ساخت خودکار ویدیو -> آپلود یوتوب -> انتشار ریل اینستاگرام (Instagram Graph API، رایگان)
+# ساخت خودکار ویدیو -> آپلود یوتوب -> ارسال به Make برای ریل اینستاگرام (رایگان)
 # هر روز ساعت ۷ UTC خودکار اجرا می‌شود. اگر صف خالی باشد خودش سناریو می‌نویسد.
 # heartbeat: هر اجرا یک commit کوچک می‌زند تا GitHub بعد از ۶۰ روز بی‌فعالیتی cron را غیرفعال نکند.
 name: make-video
@@ -48,8 +48,7 @@ jobs:
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
-          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
 
       - name: Heartbeat (keeps schedule alive)
         if: always()
